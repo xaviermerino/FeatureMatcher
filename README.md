@@ -19,27 +19,22 @@ Some options available are shown in the table below:
 
 - The `--probe_dir` option provides a path to a directory containing templates in .npy format.
 - The `--gallery_dir` option provides a path to a directory containing gallery templates in .npy format. If a path is not provided for gallery directory, this will assume the gallery equals the probe.
-- The --output_dir option provides the path where the results (scores) are going to be saved.
+- The `--output_dir` option provides the path where the results (scores) are going to be saved.
+- The `--match_type` option allows to perform matching and save scores for authentic, impostor, or both.
+- The `--group_name` option allows you to set a name for the comparison or grouN.
+- The `--score_file_type` option allows you to save the output in a text file or a csv file.
+- The `--regex_string` option allows you to specify a regex to extract the subject ID from a file name. By default, this option is not active and results in splitting the file name by underscores, taking the first piece as the name.     If a regex string is provided, the first group match will be returned as the ID.
 
-The --match_type option allows to perform matching and save scores for authentic, impostor, or both.
-The --group_name option allows you to set a name for the comparison or grouN.
-The --score_file_type option allows you to save the output in a text file or a csv file.
-The --regex_string option allows you to specify a regex to extract the subject ID from a file name.
-    By default, this option is not active and results in splitting the file name by underscores, taking
-    the first piece as the name.
     Example:
-        filename -► G0003_set1_stand_abcdefg.jpg
-        resulting subject ID -► G0003
+    ```text
+    filename -► G0003_set1_stand_abcdefg.jpg
+    resulting subject ID -► G0003
+    ```
 
-    If a regex string is provided, the first group match will be returned as the ID.
 
-The --matrix_file_type option, if set, allows you to save the score matrix as a csv or npy file. 
-    If this option is not set, a score matrix will not be saved.
+- The `--matrix_file_type` option, if set, allows you to save the score matrix as a csv or npy file. If this option is not set, a score matrix will not be saved.
     
-You will need: 
-- Directory where probe templates are stored
-- Directory where probe 
-To run:
+Sample run:
 ```
 docker run --name low_og_aaf \
 -v /home/xavier/Pictures/MORPH_Cloaking/Features/cloaked/low/aaf/templates/:/probe \
@@ -49,11 +44,3 @@ featurematcher -p /probe -g /gallery -o /output \
 --match_type all \
 --group_name low_og_aaf
 ```
-
-docker run \
--v /home/xavier/Pictures/MORPH_Cloaking/Features/cloaked/high/aaf/templates/:/probe \
--v /home/xavier/Pictures/MORPH_Cloaking/Features/og/aaf/templates/:/gallery \
--v /home/xavier/Pictures/MORPH_Cloaking/Features/matching/high_og/aaf:/output \
-featurematcher -p /probe -g /gallery -o /output \
---match_type all \
---group_name high_of_aaf
