@@ -52,17 +52,25 @@ class Matcher:
 
             if gallery_directory is None:
                 self.authentic_impostor[i, 0 : min(i + 1, num_gallery)] = -1
-        
-        self.matches = self.match_features(self.p_features, self.g_features)
 
+        # This portion makes sure that the same instance of a subject is removed.
+        # For example, if the gallery has a "ABC_123" and the probes have "ABC_123_cloaked"
+        # then it will be removed
+        locations = np.transpose(
+            np.where(np.core.defchararray.find(self.p_labels[:,np.newaxis], self.g_labels) >= 0)
+        )
+
+        for location in locations:
+            i, j = location
+            self.authentic_impostor[i, j] = -1
+
+        self.matches = self.match_features(self.p_features, self.g_features)
 
     def get_labels(self, paths:list, description:str="Labels:") -> np.ndarray:
         return np.asarray([str(p.stem) for p in tqdm(paths, desc=description)])
 
-
     def get_features(self, feature_paths:list, description:str="Features:") -> np.ndarray:
         return np.asarray([ np.load(str(fp)) for fp in tqdm(feature_paths, desc=description) ])
-
 
     def get_subject_ids(self, feature_paths:list, regexp:str=None, description:str="Subjects:") -> np.array:
         def matcher(path, regexp=None):
@@ -76,15 +84,12 @@ class Matcher:
         
         return np.asarray([matcher(f, regexp) for f in tqdm(feature_paths, desc=description)])
 
-
     def match_features(self, probes:np.ndarray, gallery:np.ndarray) -> np.ndarray:
         return cosine_similarity(probes, gallery)
-
 
     def create_label_indices(self, labels) -> np.ndarray:
         indices = np.linspace(0, len(labels) - 1, len(labels)).astype(int)
         return np.transpose(np.vstack([indices, labels]))
-
 
     def get_indices_score(self, auth_or_imp):
         x, y = np.where(self.authentic_impostor == auth_or_imp)
@@ -97,7 +102,6 @@ class Matcher:
                 ]
             )
         )
-
 
     def save_matches(self, output_directory:str, group_name:str, match_type:str="all", file_type="csv"):
         print("Saving matches output to " + f"{str(Path(output_directory))}")
@@ -122,16 +126,27 @@ class Matcher:
             gallery_labels = (self.g_labels[idx] for idx in np.int64(data[:,1]))
             scores = data[:,2]
 
-            if file_type == "csv":
-                delimiting_character = ","
-            elif file_type == "txt":
-                delimiting_character = " "
-            else:
-                raise NotImplementedError
-            
-            with open(result_directory, "w") as out:
-                csv_out = csv.writer(out, delimiter=delimiting_character)
-                csv_out.writerows(zip(probe_labels, gallery_labels, scores))
+            if file_type in ["csv", "txt"]:
+                if file_type == "csv":
+                    delimiting_character = ","
+                elif file_type == "txt":
+                    delimiting_character = " "
+                
+                with open(result_directory, "w") as out:
+                    csv_out = csv.writer(out, delimiter=delimiting_character)
+                    csv_out.writerows(zip(probe_labels, gallery_labels, scores))
+
+            elif file_type == "npy":
+                np.save(str(result_directory), scores)
+
+                if "authentic_scores" in result_directory.stem:
+                    labels_path = str(Path(output_directory) / f"{group_name}_authentic_scores_labels.txt")
+                else:
+                    labels_path = str(Path(output_directory) / f"{group_name}_impostor_scores_labels.txt")
+                
+                with open(labels_path, "w") as out:
+                    csv_out = csv.writer(out, delimiter=" ")
+                    csv_out.writerows(zip(probe_labels, gallery_labels))
     
 
     def save_score_matrix(self, output_directory:str, group_name:str, file_type="csv"):
@@ -160,7 +175,7 @@ if __name__ == "__main__":
 
     The --match_type option allows to perform matching and save scores for authentic, impostor, or both.
     The --group_name option allows you to set a name for the comparison or group.
-    The --score_file_type option allows you to save the output in a text file or a csv file.
+    The --score_file_type option allows you to save the output in a text, csv, or npy file.
     The --regex_string option allows you to specify a regex to extract the subject ID from a file name.
         By default, this option is not active and results in splitting the file name by underscores, taking
         the first piece as the name.
@@ -180,7 +195,7 @@ if __name__ == "__main__":
     parser.add_argument('-o', '--output_dir', type=str, help='path to output directory', required=True)
     parser.add_argument('-m', '--match_type', type=str, choices=['authentic', 'impostor', 'all'], default='all', help='type of match to perform\n(default: all)')
     parser.add_argument('--matcher', type=str, choices=['cosinesimilarity'], default='cosinesimilarity', help='algorithm used to compare features\n(default: cosinesimilarity)')
-    parser.add_argument('--score_file_type', type=str, choices=['csv', 'txt'], default='txt', help='type of scores file to output\n(default: txt)')
+    parser.add_argument('--score_file_type', type=str, choices=['csv', 'txt', 'npy'], default='txt', help='type of scores file to output\n(default: txt)')
     parser.add_argument('--matrix_file_type', type=str, choices=['csv', 'npy'], default=None, help='type of score matrix file to output\n(default: None)')
     parser.add_argument('--group_name', type=str, default="group", help='name of the group or comparison\n(default: group)')
     parser.add_argument('-r', '--regex_string', type=str, default=None, help='regular expression to extract subject ID from files\n(default: None)')
