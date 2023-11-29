@@ -137,6 +137,7 @@ class Matcher:
                     csv_out.writerows(zip(probe_labels, gallery_labels, scores))
 
             elif file_type == "npy":
+                print("Currently writing scores...")
                 np.save(str(result_directory), scores)
 
                 if not skip_labels:
