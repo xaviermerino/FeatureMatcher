@@ -103,7 +103,7 @@ class Matcher:
             )
         )
 
-    def save_matches(self, output_directory:str, group_name:str, match_type:str="all", file_type="csv"):
+    def save_matches(self, output_directory:str, group_name:str, match_type:str="all", file_type="csv", skip_labels: bool = False):
         print("Saving matches output to " + f"{str(Path(output_directory))}")
         
         if match_type not in ["all", "authentic", "impostor"]: raise TypeError
@@ -126,12 +126,12 @@ class Matcher:
             gallery_labels = (self.g_labels[idx] for idx in np.int64(data[:,1]))
             scores = data[:,2]
 
+            if file_type in ["csv", "npy"]:
+                delimiting_character = ","
+            elif file_type == "txt":
+                delimiting_character = " "
+
             if file_type in ["csv", "txt"]:
-                if file_type == "csv":
-                    delimiting_character = ","
-                elif file_type == "txt":
-                    delimiting_character = " "
-                
                 with open(result_directory, "w") as out:
                     csv_out = csv.writer(out, delimiter=delimiting_character)
                     csv_out.writerows(zip(probe_labels, gallery_labels, scores))
@@ -139,14 +139,15 @@ class Matcher:
             elif file_type == "npy":
                 np.save(str(result_directory), scores)
 
-                if "authentic_scores" in result_directory.stem:
-                    labels_path = str(Path(output_directory) / f"{group_name}_authentic_scores_labels.txt")
-                else:
-                    labels_path = str(Path(output_directory) / f"{group_name}_impostor_scores_labels.txt")
-                
-                with open(labels_path, "w") as out:
-                    csv_out = csv.writer(out, delimiter=" ")
-                    csv_out.writerows(zip(probe_labels, gallery_labels))
+                if not skip_labels:
+                    if "authentic_scores" in result_directory.stem:
+                        labels_path = str(Path(output_directory) / f"{group_name}_authentic_scores_labels.txt")
+                    else:
+                        labels_path = str(Path(output_directory) / f"{group_name}_impostor_scores_labels.txt")
+                    
+                    with open(labels_path, "w") as out:
+                        csv_out = csv.writer(out, delimiter=delimiting_character)
+                        csv_out.writerows(zip(probe_labels, gallery_labels))
     
 
     def save_score_matrix(self, output_directory:str, group_name:str, file_type="csv"):
@@ -197,6 +198,7 @@ if __name__ == "__main__":
     parser.add_argument('--matcher', type=str, choices=['cosinesimilarity'], default='cosinesimilarity', help='algorithm used to compare features\n(default: cosinesimilarity)')
     parser.add_argument('--score_file_type', type=str, choices=['csv', 'txt', 'npy'], default='txt', help='type of scores file to output\n(default: txt)')
     parser.add_argument('--matrix_file_type', type=str, choices=['csv', 'npy'], default=None, help='type of score matrix file to output\n(default: None)')
+    parser.add_argument('--skip-labels', action='store_true', help='If set, skips saving labels. Only in effect when score_file_type is set to npy.')
     parser.add_argument('--group_name', type=str, default="group", help='name of the group or comparison\n(default: group)')
     parser.add_argument('-r', '--regex_string', type=str, default=None, help='regular expression to extract subject ID from files\n(default: None)')
     args = parser.parse_args()
@@ -204,7 +206,7 @@ if __name__ == "__main__":
     Path(args.output_dir).mkdir(exist_ok=True, parents=True) 
 
     m = Matcher(args.probe_dir, args.gallery_dir, args.regex_string)
-    m.save_matches(args.output_dir, args.group_name, match_type=args.match_type, file_type=args.score_file_type)
+    m.save_matches(args.output_dir, args.group_name, match_type=args.match_type, file_type=args.score_file_type, skip_labels=args.skip_labels)
 
     if args.matrix_file_type is not None:
         m.save_score_matrix(args.output_dir, args.group_name, args.matrix_file_type)
