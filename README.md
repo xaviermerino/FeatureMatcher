@@ -7,9 +7,9 @@ Below is a detailed overview of the command-line options available in Feature Ma
 
 | Option                | Short Option | Description                                                                                | Default  |
 |-----------------------|--------------|--------------------------------------------------------------------------------------------|----------|
-| `--probe-dir`         | `-p`         | Directory path containing .npy format templates.                                           | `/input` |
+| `--probe-dir`         | `-p`         | Directory path containing .npy format templates.                                           | N/A |
 | `--gallery-dir`       | `-g`         | Gallery directory path. Defaults to the probe directory if not specified.                  | N/A      |
-| `--output-dir`        | `-o`         | Destination for results like scores and labels.                                            | `/output`|
+| `--output-dir`        | `-o`         | Destination for results like scores and labels.                                            | N/A |
 | `--match-type`        | `-m`         | Type of matching to perform (authentic, impostor, or all).                                 | `all`    |
 | `--regex-subject`     | `-s`         | Regex pattern for extracting subject ID from file names.                                   | None     |
 | `--regex-label`       | `-l`         | Regex pattern for extracting label ID from probe file names.                                     | None     |
@@ -50,11 +50,13 @@ docker tag ghcr.io/xaviermerino/featurematcher:latest featurematcher
 To deploy Feature Matcher in a Docker container for comparing probes against themselves and generating authentic, impostor scores, and labels, use the following command:
 
 ```bash
-docker run --name feature_matcher_instance \
+docker run --rm --name feature_matcher_instance \
 --net host \
 -v /path/to/probe/templates:/input \
 -v /path/to/output:/output \
-featurematcher
+featurematcher \
+--probe-dir /input \
+--output-dir /output
 ```
 
 This command:
@@ -82,6 +84,7 @@ docker run --name advanced_feature_matcher \
 featurematcher \
 --probe-dir /input \
 --gallery-dir /gallery \
+--output-dir /output \
 --regex-label '^(.*?)_cloaked_high$'
 ```
 
