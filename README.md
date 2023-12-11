@@ -1,7 +1,7 @@
 # Feature Matcher
 Feature Matcher is a tool for matching biometric templates. It supports various options for handling probe and gallery directories, output formats, and matching types.
 
-<!-- > Note: This version uses Dask. To use the previous, single-core, version, check out the xxx branch.  -->
+> Note: This version uses Dask. To use the previous, single-core, version, check out the `single-core` branch. 
 
 ## ⚙️ Options
 
