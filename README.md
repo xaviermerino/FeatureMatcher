@@ -105,14 +105,14 @@ By default, the output directory structure appears as follows:
 │   │   ├── authentic_labels_00.csv
 │   │   ├── authentic_labels_01.csv
 │   │   ├── authentic_labels_02.csv
-│   │   ├── ...
+│   │   └── ...
 │   └── impostor
 └── scores
     ├── authentic
     │   ├── 0.npy
     │   ├── 100.npy
     │   ├── 101.npy
-    │   ├── ...
+    │   └── ...
     └── impostor
 ```
 
