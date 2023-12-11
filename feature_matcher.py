@@ -1,213 +1,534 @@
 import argparse
-import csv
 import os
 import re
+import time
+import warnings
 from pathlib import Path
+from typing import Any, Callable, List, Tuple
 
+import dask
+import dask.array as da
+import dask.dataframe as dd
 import numpy as np
-import pandas as pd
+from bokeh.util.warnings import BokehUserWarning
+from dask.array.core import PerformanceWarning
+from dask.distributed import Client
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 
+warnings.filterwarnings("ignore", category=BokehUserWarning)
+warnings.filterwarnings(
+    "ignore", message="Consider scattering data ahead of time and using futures."
+)
+warnings.filterwarnings(
+    "ignore", category=UserWarning, message="Sending large graph of size *"
+)
+warnings.filterwarnings(
+    "ignore", category=PerformanceWarning, message="Sending large graph of size *"
+)
+warnings.filterwarnings(
+    "ignore",
+    category=PerformanceWarning,
+    message="Increasing number of chunks by factor of *",
+)
+dask.config.set({"logging.distributed": "error"})
 
-def list_files(path:str, allowed_ext:list) -> list:
+
+def list_files(path: str, allowed_ext: list) -> list:
     return [
-        Path(os.path.join(dp, f)) 
-        for dp, dn, filenames in os.walk(path) 
-        for f in filenames 
+        Path(os.path.join(dp, f))
+        for dp, dn, filenames in os.walk(path)
+        for f in filenames
         if os.path.splitext(f)[1] in allowed_ext
     ]
 
 
-class Matcher:
-    def __init__(self, probe_directory:str, gallery_directory:str=None, subject_id_regexp:str=None):
-        p_templates = list_files(probe_directory, [".npy"])
-        self.p_features = self.get_features(p_templates, "Probe Features: ")
-        self.p_subjects = self.get_subject_ids(p_templates, subject_id_regexp, "Probe Subjects: ")
-        self.p_labels = self.get_labels(p_templates, "Probe Labels: ")
+def get_labels(
+    paths: list, regexp: str = None, description: str = "Labels:"
+) -> np.ndarray:
+    def matcher(path, regexp=regexp):
+        filename = str(Path(path).stem)
+        match = re.search(regexp, filename)
+        if not match:
+            raise TypeError
+        return match.group(1)
 
-        if gallery_directory is None:
-            print(f"Matching {probe_directory} to {probe_directory}")
-            g_templates = p_templates
-            self.g_features = self.p_features
-            self.g_subjects = self.p_subjects
-            self.g_labels = self.p_labels
-        else:
-            print(f"Matching {probe_directory} to {gallery_directory}")
-            g_templates = list_files(gallery_directory, [".npy"])
-            self.g_features = self.get_features(g_templates, "Gallery Features: ")
-            self.g_subjects = self.get_subject_ids(g_templates, subject_id_regexp, "Gallery Subjects: ")
-            self.g_labels = self.get_labels(g_templates, "Gallery Labels: ")
-            self.probe_equal_gallery = False
-
-
-        num_probes, num_gallery = len(p_templates), len(g_templates)
-
-        # This matrix has:
-        #   0:  Impostors, 1:  Authentic, -1: Marked for Removal
-        self.authentic_impostor = np.zeros(shape=(num_probes, num_gallery), dtype=np.int8)
-        for i in range(num_probes):
-            self.authentic_impostor[i, self.p_subjects[i] == self.g_subjects] = 1
-            self.authentic_impostor[i, self.p_labels[i] == self.g_labels] = -1
-
-            if gallery_directory is None:
-                self.authentic_impostor[i, 0 : min(i + 1, num_gallery)] = -1
-
-        # This portion makes sure that the same instance of a subject is removed.
-        # For example, if the gallery has a "ABC_123" and the probes have "ABC_123_cloaked"
-        # then it will be removed
-        locations = np.transpose(
-            np.where(np.core.defchararray.find(self.p_labels[:,np.newaxis], self.g_labels) >= 0)
-        )
-
-        for location in locations:
-            i, j = location
-            self.authentic_impostor[i, j] = -1
-
-        self.matches = self.match_features(self.p_features, self.g_features)
-
-    def get_labels(self, paths:list, description:str="Labels:") -> np.ndarray:
+    if regexp is None:
         return np.asarray([str(p.stem) for p in tqdm(paths, desc=description)])
+    else:
+        return np.asarray([matcher(f, regexp) for f in tqdm(paths, desc=description)])
 
-    def get_features(self, feature_paths:list, description:str="Features:") -> np.ndarray:
-        return np.asarray([ np.load(str(fp)) for fp in tqdm(feature_paths, desc=description) ])
 
-    def get_subject_ids(self, feature_paths:list, regexp:str=None, description:str="Subjects:") -> np.array:
-        def matcher(path, regexp=None):
-            filename = str(Path(path).stem)
-            if regexp is None:
-                return filename.split("_")[0]
-            else:
-                match = re.search(regexp, filename)
-                if not match: raise TypeError
-                return match.group(0)
-        
-        return np.asarray([matcher(f, regexp) for f in tqdm(feature_paths, desc=description)])
+def get_features(feature_paths: list, description: str = "Features:") -> np.ndarray:
+    return np.asarray(
+        [np.load(str(fp)) for fp in tqdm(feature_paths, desc=description)]
+    )
 
-    def match_features(self, probes:np.ndarray, gallery:np.ndarray) -> np.ndarray:
-        return cosine_similarity(probes, gallery)
 
-    def create_label_indices(self, labels) -> np.ndarray:
-        indices = np.linspace(0, len(labels) - 1, len(labels)).astype(int)
-        return np.transpose(np.vstack([indices, labels]))
+def get_subject_ids(
+    feature_paths: list, regexp: str = None, description: str = "Subjects:"
+) -> np.ndarray:
+    def matcher(path, regexp=None):
+        filename = str(Path(path).stem)
+        if regexp is None:
+            return filename.split("_")[0]
+        else:
+            match = re.search(regexp, filename)
+            if not match:
+                raise TypeError
+            return match.group(1)
 
-    def get_indices_score(self, auth_or_imp):
-        x, y = np.where(self.authentic_impostor == auth_or_imp)
-        return np.transpose(
-            np.vstack(
-                [
-                    x,
-                    y,
-                    np.round(self.matches[self.authentic_impostor == auth_or_imp], 6),
-                ]
-            )
+    return np.asarray(
+        [matcher(f, regexp) for f in tqdm(feature_paths, desc=description)]
+    )
+
+
+def daskified_cosine_similarity(X: da.Array, Y: np.ndarray, **kwargs: Any):
+    if not isinstance(Y, np.ndarray):
+        raise TypeError("`Y` must be a numpy array")
+
+    chunks = (X.chunks[0], (len(Y),))
+    return X.map_blocks(cosine_similarity, Y, dtype=np.float16, chunks=chunks, **kwargs)
+
+
+def match_features(
+    probes: np.ndarray, gallery: np.ndarray, match_chunk_size: int
+) -> da.Array:
+    probes = da.from_array(probes, chunks=({0: match_chunk_size, 1: -1}))
+    similarity_matrix = daskified_cosine_similarity(probes, gallery)
+    return similarity_matrix
+
+
+def diagonal_mask(probe: da.Array, probe_index: da.Array, gallery: set) -> np.ndarray:
+    probe = probe.ravel()
+    probe_index = probe_index.ravel()
+    num_probes = len(probe)
+    gallery_size = len(gallery)
+
+    result = np.empty((num_probes, gallery_size), dtype=np.bool_)
+
+    for i in range(num_probes):
+        p, index = probe[i], probe_index[i]
+        if p not in gallery:
+            result[i] = np.ones(gallery_size, dtype=np.bool_)
+        else:
+            result[i] = np.zeros(gallery_size, dtype=np.bool_)
+            result[i, index:] = np.True_
+
+    return result
+
+
+def process_scores(
+    match_type: str,
+    matches: da.Array,
+    mask: da.Array,
+    output_directory: str,
+):
+    scores_directory = Path(output_directory) / "scores"
+    scores_directory.mkdir(exist_ok=True, parents=True)
+    score_file_path = str(scores_directory / match_type)
+
+    scores = matches[mask.ravel()]
+    print(f"Saving {match_type} scores to {score_file_path}")
+    da.to_npy_stack(score_file_path, scores, axis=0)
+
+
+def process_labels(
+    match_type: str,
+    mask: da.Array,
+    p_labels_da: da.Array,
+    g_labels_da: da.Array,
+    output_directory: str,
+    label_chunk_size: int,
+):
+    x, y = da.where(mask == True)
+
+    # This code calculates the chunks for later division
+    # using `label_chunk_size`. Commented out because
+    # performance is better without it at the moment.
+
+    # x.compute_chunk_sizes(), y.compute_chunk_sizes()
+    # x = x.rechunk(chunks=(label_chunk_size,))
+    # y = y.rechunk(chunks=(label_chunk_size,))
+
+    probe_label = p_labels_da[x]
+    gallery_label = g_labels_da[y]
+
+    label_pairs = da.concatenate(
+        [probe_label[:, None], gallery_label[:, None]],
+        axis=1,
+        allow_unknown_chunksizes=True,
+    )  # .rechunk(chunks=(label_chunk_size, 2))
+
+    labels_directory = Path(output_directory) / "labels"
+    labels_directory.mkdir(exist_ok=True, parents=True)
+    labels_file_path = str(labels_directory / match_type / f"{match_type}_labels_*.csv")
+
+    pairs_ddf = dd.from_dask_array(label_pairs, columns=["probe", "gallery"])
+    print(f"Saving {match_type} labels to {labels_file_path}")
+    pairs_ddf.to_csv(
+        labels_file_path,
+        index=False,
+        header=False,
+    )
+
+
+def load_data(
+    directory: str,
+    regexp_subject: str = None,
+    regexp_label: str = None,
+    skip_matches: bool = False,
+    description="Probe",
+) -> Tuple[List[Path], np.ndarray, np.ndarray, np.ndarray]:
+    templates = sorted(list_files(directory, [".npy"]))
+    features = None
+    if not skip_matches:
+        features = get_features(templates, f"{description} Features: ")
+    subjects = get_subject_ids(
+        templates, regexp=regexp_subject, description=f"{description} Subjects: "
+    )
+    labels = get_labels(templates, regexp=regexp_label, description="Labels: ")
+    return templates, features, subjects, labels
+
+
+def get_diagonal_mask(
+    p_labels_da: da.Array,
+    p_indices_da: da.Array,
+    g_labels: set,
+    probe_equal_gallery: bool,
+    num_probes: int,
+    num_gallery: int,
+) -> da.Array:
+    if probe_equal_gallery:
+        return da.tri(
+            num_probes,
+            num_gallery,
+            dtype=np.bool_,
+            chunks=({0: "auto", 1: num_gallery}),
+        )
+    else:
+        reshaped_labels = p_labels_da[:, None]
+        reshaped_indices = p_indices_da[:, None]
+        return reshaped_labels.map_blocks(
+            diagonal_mask, reshaped_indices, g_labels, dtype=np.bool_
         )
 
-    def save_matches(self, output_directory:str, group_name:str, match_type:str="all", file_type="csv", skip_labels: bool = False):
-        print("Saving matches output to " + f"{str(Path(output_directory))}")
-        
-        if match_type not in ["all", "authentic", "impostor"]: raise TypeError
-        
-        authentic_output = Path(output_directory) / f"{group_name}_authentic_scores.{file_type}"
-        impostor_output = Path(output_directory) / f"{group_name}_impostor_scores.{file_type}"
 
-        if match_type == "all":
-            authentic, impostor = self.get_indices_score(1), self.get_indices_score(0)
-            choices = [(authentic_output, authentic), (impostor_output, impostor)]
-        elif match_type == "authentic":
-            authentic = self.get_indices_score(1)
-            choices = [(authentic_output, authentic)]
-        elif match_type == "impostor":
-            impostor = self.get_indices_score(0)
-            choices = [(impostor_output, impostor)]
+def main(
+    probe_directory: str,
+    gallery_directory: str = None,
+    output_directory: str = None,
+    regexp_label: str = None,
+    regexp_subject: str = None,
+    match_type: str = "all",
+    persist: bool = False,
+    skip_labels: bool = False,
+    skip_matches: bool = False,
+    match_chunk_size: int = 64,
+    mask_chunk_size: int = 256,
+    label_chunk_size: int = 512,
+):
+    if skip_labels and skip_matches:
+        print("Nothing to do. Closing.")
+        return
 
-        for result_directory, data in choices:
-            probe_labels = (self.p_labels[idx] for idx in np.int64(data[:,0]))
-            gallery_labels = (self.g_labels[idx] for idx in np.int64(data[:,1]))
-            scores = data[:,2]
+    # Create match and label plans
+    match_plan = (
+        ["match_authentic", "match_impostor"] if match_type == "all" else [match_type]
+    )
+    label_plan = (
+        ["label_authentic", "label_impostor"] if match_type == "all" else [match_type]
+    )
+    match_plan = [] if skip_matches else match_plan
+    label_plan = [] if skip_labels else label_plan
+    plan = match_plan + label_plan
 
-            if file_type in ["csv", "npy"]:
-                delimiting_character = ","
-            elif file_type == "txt":
-                delimiting_character = " "
+    p_templates, p_features, p_subjects, p_labels = load_data(
+        directory=probe_directory,
+        regexp_subject=regexp_subject,
+        regexp_label=regexp_label,
+        skip_matches=skip_matches,
+    )
+    probe_equal_gallery = (
+        gallery_directory is None or probe_directory == gallery_directory
+    )
 
-            if file_type in ["csv", "txt"]:
-                with open(result_directory, "w") as out:
-                    csv_out = csv.writer(out, delimiter=delimiting_character)
-                    csv_out.writerows(zip(probe_labels, gallery_labels, scores))
+    if probe_equal_gallery:
+        g_templates, g_features, g_subjects, g_labels = (
+            p_templates,
+            p_features,
+            p_subjects,
+            p_labels,
+        )
+        print(f"Matching {probe_directory} to itself")
+    else:
+        g_templates, g_features, g_subjects, g_labels = load_data(
+            directory=gallery_directory,
+            regexp_subject=regexp_subject,
+            regexp_label=None,
+            skip_matches=skip_matches,
+            description="Gallery",
+        )
+        print(f"Matching {probe_directory} to {gallery_directory}")
 
-            elif file_type == "npy":
-                print("Currently writing scores...")
-                np.save(str(result_directory), scores)
+    with Client() as client:
+        print("Dashboard: ", client.dashboard_link)
+        try:
+            # Convert to Dask arrays and chunk
+            p_subjects_da = da.from_array(p_subjects, chunks=(mask_chunk_size,))
+            g_subjects_da = da.from_array(g_subjects)
+            p_labels_da = da.from_array(p_labels, chunks=(mask_chunk_size,))
+            g_labels_da = da.from_array(g_labels)
+            p_indices_da = da.arange(len(p_labels_da), chunks=(mask_chunk_size,))
 
-                if not skip_labels:
-                    if "authentic_scores" in result_directory.stem:
-                        labels_path = str(Path(output_directory) / f"{group_name}_authentic_scores_labels.txt")
-                    else:
-                        labels_path = str(Path(output_directory) / f"{group_name}_impostor_scores_labels.txt")
-                    
-                    with open(labels_path, "w") as out:
-                        csv_out = csv.writer(out, delimiter=delimiting_character)
-                        csv_out.writerows(zip(probe_labels, gallery_labels))
-    
+            if not skip_matches:
+                matches = match_features(
+                    p_features, g_features, match_chunk_size
+                ).ravel()
 
-    def save_score_matrix(self, output_directory:str, group_name:str, file_type="csv"):
-        print("Saving score matrix to " + f"{str(Path(output_directory))}")
-        matrix_output = Path(output_directory) / f"{group_name}_score_matrix.{file_type}"
+            # `mask_diagonal` marks redundant locations to avoid storing
+            # reverse comparisons (e.g., A <=> B and B <=> A)
+            mask_diagonal = get_diagonal_mask(
+                p_labels_da=p_labels_da,
+                p_indices_da=p_indices_da,
+                g_labels=set(g_labels),
+                probe_equal_gallery=probe_equal_gallery,
+                num_probes=len(p_templates),
+                num_gallery=len(g_templates),
+            )
 
-        if file_type == "csv":
-            df = pd.DataFrame(self.matches, index=self.p_labels, columns=self.g_labels)
-            df.to_csv(str(matrix_output))
-        elif file_type == "npy":
-            matrix_row_labels = str(Path(output_directory) / f"{group_name}_score_matrix_row_labels.txt")
-            matrix_col_labels = str(Path(output_directory) / f"{group_name}_score_matrix_col_labels.txt")
-            np.save(str(matrix_output), self.matches)
-            np.savetxt(matrix_row_labels, self.p_labels, fmt="%s")
-            np.savetxt(matrix_col_labels, self.g_labels, fmt="%s")
+            # `mask_type` marks whether comparsion is mater or non-mated.
+            # True denotes mated, False denotes non-mated.
+            mask_type = p_subjects_da[:, None] == g_subjects_da
+
+            # `mask_labels` marks whether comparison is invalid.
+            # Invalid (True) means same image comparison.
+            mask_labels = p_labels_da[:, None] == g_labels_da
+
+            # `mask_authentic` is the final mask for mated comparisons.
+            mask_authentic = da.bitwise_and(
+                da.bitwise_xor(mask_type, mask_labels), mask_diagonal
+            )
+
+            # `mask_impostor` is the final mask for non-mated comparisons.
+            mask_impostor = da.bitwise_and(da.bitwise_not(mask_type), mask_diagonal)
+
+            if persist:
+                if "match_authentic" in plan and "label_authentic" in plan:
+                    mask_authentic.persist()
+                if "match_impostor" in plan and "label_impostor" in plan:
+                    mask_impostor.persist()
+                if "match_authentic" in plan and "match_impostor" in plan:
+                    matches.persist()
+
+            # Processing Match Scores
+            if match_plan:
+                for mp in match_plan:
+                    score_type = mp.split("_")[-1]
+                    mask = (
+                        mask_authentic if score_type == "authentic" else mask_impostor
+                    )
+                    process_scores(
+                        match_type=score_type,
+                        matches=matches,
+                        mask=mask,
+                        output_directory=output_directory,
+                    )
+
+                del matches
+
+            # Processing Label Pairs
+            if label_plan:
+                p_labels = get_labels(
+                    p_templates, regexp=None, description="Probe Labels: "
+                )
+                p_labels_da = da.from_array(p_labels, chunks=(label_chunk_size,))
+                g_labels_da = g_labels_da.rechunk(chunks=(label_chunk_size,))
+
+                for lp in label_plan:
+                    label_type = lp.split("_")[-1]
+                    mask = (
+                        mask_authentic if label_type == "authentic" else mask_impostor
+                    )
+                    process_labels(
+                        match_type=label_type,
+                        mask=mask,
+                        output_directory=output_directory,
+                        p_labels_da=p_labels_da,
+                        g_labels_da=g_labels_da,
+                        label_chunk_size=label_chunk_size,
+                    )
+
+                    del mask
+
+            time.sleep(2)
+            print("Done!")
+
+        except Exception as e:
+            print("[ERROR]", e)
 
 
 if __name__ == "__main__":
     description = """Feature Matcher for Biometric Templates
     
-    The --probe_dir option provides a path to a directory containing templates in .npy format.
-    The --gallery_dir option provides a path to a directory containing gallery templates in .npy format.
+    The --probe-dir option provides a path to a directory containing templates in .npy format.
+    
+    The --gallery-dir option provides a path to a directory containing gallery templates in .npy format.
         If a path is not provided for gallery directory, this will assume the gallery equals the probe.
     
-    The --output_dir option provides the path where the results (scores) are going to be saved.
-
-    The --match_type option allows to perform matching and save scores for authentic, impostor, or both.
-    The --group_name option allows you to set a name for the comparison or group.
-    The --score_file_type option allows you to save the output in a text, csv, or npy file.
-    The --regex_string option allows you to specify a regex to extract the subject ID from a file name.
-        By default, this option is not active and results in splitting the file name by underscores, taking
-        the first piece as the name.
-        Example:
-            filename -► G0003_set1_stand_abcdefg.jpg
-            resulting subject ID -► G0003
-
+    The --output-dir option provides the path where the results (scores, labels) are going to be saved.
+    
+    The --match-type option allows to perform matching and save scores for authentic, impostor, or both.
+    
+    The --regex-subject option allows you to specify a regex to extract the subject ID from a file name.
+        By default, this option is not active and subjects are extracted by splitting the file name
+        by underscores, taking the first piece as the name. Extensions are omitted.
         If a regex string is provided, the first group match will be returned as the ID.
 
-    The --matrix_file_type option, if set, allows you to save the score matrix as a csv or npy file. 
-        If this option is not set, a score matrix will not be saved.
-"""
-    parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawTextHelpFormatter)
+        Example (no regex):
+            filename -► G0003_set1_stand_abcdefg
+            resulting subject ID -► G0003
 
-    parser.add_argument('-p', '--probe_dir', type=str, help='path to the probe directory', required=True)
-    parser.add_argument('-g', '--gallery_dir', type=str, help='path to the gallery directory')
-    parser.add_argument('-o', '--output_dir', type=str, help='path to output directory', required=True)
-    parser.add_argument('-m', '--match_type', type=str, choices=['authentic', 'impostor', 'all'], default='all', help='type of match to perform\n(default: all)')
-    parser.add_argument('--matcher', type=str, choices=['cosinesimilarity'], default='cosinesimilarity', help='algorithm used to compare features\n(default: cosinesimilarity)')
-    parser.add_argument('--score_file_type', type=str, choices=['csv', 'txt', 'npy'], default='txt', help='type of scores file to output\n(default: txt)')
-    parser.add_argument('--matrix_file_type', type=str, choices=['csv', 'npy'], default=None, help='type of score matrix file to output\n(default: None)')
-    parser.add_argument('--skip-labels', action='store_true', help='If set, skips saving labels. Only in effect when score_file_type is set to npy.')
-    parser.add_argument('--group_name', type=str, default="group", help='name of the group or comparison\n(default: group)')
-    parser.add_argument('-r', '--regex_string', type=str, default=None, help='regular expression to extract subject ID from files\n(default: None)')
+        Example (with regex):
+            filename -► G0003_set1_stand_abcdefg
+            regex -► ^([^_]+)
+            resulting subject ID -► G0003
+
+    The --regex-label option allows you to specify a regex to extract the label ID from a file name.
+        By default, this option is not active and the label is considered to be the file name. 
+        This option is useful when a treatment has been applied to an image. Extensions are omitted.
+        If a regex string is provided, the first group match will be returned as the ID.
+
+        Example (no regex):
+            filename -► G0003_set1_stand_abcdefg_color_corrected
+            resulting label ID -► G0003_set1_stand_abcdefg_color_corrected
+
+        Example (with regex):
+            filename -► G0003_set1_stand_abcdefg_color_corrected
+            regex -► ^(.*?)_color_corrected$
+            resulting label ID -► G0003_set1_stand_abcdefg
+    
+    The --skip-labels option indicates not to store the label pairs. Label generation consumes
+        significant memory and time.
+    
+    The --skip-matches option indicates not to store the match scores. May be useful when only
+        label generation is required.
+
+    The --persist option indicates to cache intermediate computation results to potentially speed up
+        related computations. This is only advisable if you have enough memory, otherwise you may
+        incur penalties for spilling intermediate results to disk.
+        
+    The --match-chunk-size option allows you to specify how many probes to process per chunk. 
+        By default, this is set to 64. Feel free to increase/decrease it based on your setup.
+        This option directly affects performance of match score calculation.
+    
+    The --mask-chunk-size option allows you to specify how many probes/gallery entries are 
+        considered for mask (i.e., authentic, impostor) generation. By default this is set
+        to 256. Feel free to increase/decrease it based on your setup.
+        This option directly affects performance of authentic/impostor determination.
+
+    The --label-chunk-size option allows you to specify how many label pairs entries are 
+        generated at a time for export into CSV. By default this is set to 512. 
+        Feel free to increase/decrease it based on your setup.
+        This option directly affects performance of label pair generation.
+        [Note: Not Implemented]
+"""
+
+    parser = argparse.ArgumentParser(
+        description=description, formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        "-p",
+        "--probe-dir",
+        type=str,
+        help="path to the probe directory",
+        required=True,
+        default="/input",
+    )
+    parser.add_argument(
+        "-g",
+        "--gallery-dir",
+        type=str,
+        help="path to the gallery directory",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        type=str,
+        help="path to output directory",
+        required=True,
+        default="/output",
+    )
+    parser.add_argument(
+        "-m",
+        "--match-type",
+        type=str,
+        choices=["authentic", "impostor", "all"],
+        default="all",
+        help="type of match to perform\n(default: all)",
+    )
+    parser.add_argument(
+        "-s",
+        "--regex-subject",
+        type=str,
+        default=None,
+        help="regex to extract subject ID from files\n(default: None)",
+    )
+    parser.add_argument(
+        "-l",
+        "--regex-label",
+        type=str,
+        default=None,
+        help="regex to extract label ID from files\n(default: None)",
+    )
+    parser.add_argument(
+        "--match-chunk-size",
+        type=int,
+        help="chunk size for similarity matrix calculation\n(default: 64)",
+        required=False,
+        default=64,
+    )
+    parser.add_argument(
+        "--mask-chunk-size",
+        type=int,
+        help="chunk size for calculating authentic and impostor masks\n(default: 256)",
+        required=False,
+        default=256,
+    )
+    parser.add_argument(
+        "--label-chunk-size",
+        type=int,
+        help="chunk size for generating label pairs\n(default: 512) [NotImplemented]",
+        required=False,
+        default=512,
+    )
+    parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="if set, caches intermediate results for reuse.",
+    )
+    parser.add_argument(
+        "--skip-labels", action="store_true", help="if set, skips saving labels."
+    )
+    parser.add_argument(
+        "--skip-matches", action="store_true", help="if set, skips saving match scores."
+    )
+
     args = parser.parse_args()
 
-    Path(args.output_dir).mkdir(exist_ok=True, parents=True) 
+    Path(args.output_dir).mkdir(exist_ok=True, parents=True)
 
-    m = Matcher(args.probe_dir, args.gallery_dir, args.regex_string)
-    m.save_matches(args.output_dir, args.group_name, match_type=args.match_type, file_type=args.score_file_type, skip_labels=args.skip_labels)
-
-    if args.matrix_file_type is not None:
-        m.save_score_matrix(args.output_dir, args.group_name, args.matrix_file_type)
+    main(
+        probe_directory=args.probe_dir,
+        gallery_directory=args.gallery_dir,
+        output_directory=args.output_dir,
+        regexp_label=args.regex_label,
+        regexp_subject=args.regex_subject,
+        match_type=args.match_type,
+        persist=args.persist,
+        skip_labels=args.skip_labels,
+        skip_matches=args.skip_matches,
+        match_chunk_size=args.match_chunk_size,
+        mask_chunk_size=args.mask_chunk_size,
+        label_chunk_size=args.label_chunk_size,
+    )

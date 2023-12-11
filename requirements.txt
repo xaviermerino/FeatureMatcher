@@ -2,3 +2,7 @@ numpy
 tqdm
 pandas
 scikit-learn
+dask[complete]
+dask-ml[complete]
+pyarrow
+msgpack
