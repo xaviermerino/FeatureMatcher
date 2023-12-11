@@ -12,7 +12,7 @@ Below is a detailed overview of the command-line options available in Feature Ma
 | `--output-dir`        | `-o`         | Destination for results like scores and labels.                                            | `/output`|
 | `--match-type`        | `-m`         | Type of matching to perform (authentic, impostor, or all).                                 | `all`    |
 | `--regex-subject`     | `-s`         | Regex pattern for extracting subject ID from file names.                                   | None     |
-| `--regex-label`       | `-l`         | Regex pattern for extracting label ID from file names.                                     | None     |
+| `--regex-label`       | `-l`         | Regex pattern for extracting label ID from probe file names.                                     | None     |
 | `--skip-labels`       | N/A          | Option to skip storing label pairs, useful for score-only scenarios.                       | `False`  |
 | `--skip-matches`      | N/A          | Option to skip storing match scores, useful for label-only scenarios.                      | `False`  |
 | `--persist`           | N/A          | Enables caching of intermediate results, recommended only with ample RAM.                  | `False`  |
@@ -51,6 +51,7 @@ To deploy Feature Matcher in a Docker container for comparing probes against the
 
 ```bash
 docker run --name feature_matcher_instance \
+--net host \
 -v /path/to/probe/templates:/input \
 -v /path/to/output:/output \
 featurematcher
@@ -60,6 +61,7 @@ This command:
 
 - Runs the Feature Matcher in a Docker container named `feature_matcher_instance`.
 - Mounts directories for probe templates, gallery templates, and output results.
+- Opens up a dashboard to inspect progress on `https://127.0.0.1:8787/status`. The address might change if multiple instances are opened.
 - Replace `/path/to/probe/templates` and `/path/to/output` with the actual paths to your probe templates and output directory, respectively.
 
 ### 🏃🏃 Advanced Usage: Handling Treated Gallery Images
@@ -73,6 +75,7 @@ With these naming conventions, the following command can be used:
 
 ```bash
 docker run --name advanced_feature_matcher \
+--net host \
 -v /path/to/probe/templates:/input \
 -v /path/to/gallery/templates:/gallery \
 -v /path/to/output:/output \
@@ -86,8 +89,51 @@ This command:
 
 - Runs the Feature Matcher in a Docker container named `advanced_feature_matcher`.
 - Mounts directories for probe templates, gallery templates, and output results.
-- Uses the `--regex-label` option with a regex pattern to correctly extract and match labels from filenames, distinguishing between color-corrected and original images.
+- Opens up a dashboard to inspect progress on `https://127.0.0.1:8787/status`. The address might change if multiple instances are opened.
+- Uses the `--regex-label` option with a regex pattern to correctly extract and match labels from probe filenames, distinguishing between color-corrected and original images.
 - Replace `/path/to/probe/templates`, `/path/to/gallery/templates`, and `/path/to/output` with the actual paths to your probe templates, gallery templates, and output directory, respectively.
+
+## 📈 Understanding the Output
+
+The Feature Matcher in this version generates multiple components as output, all organized within a designated directory.
+
+By default, the output directory structure appears as follows:
+```
+.
+├── labels
+│   ├── authentic
+│   │   ├── authentic_labels_00.csv
+│   │   ├── authentic_labels_01.csv
+│   │   ├── authentic_labels_02.csv
+│   │   ├── ...
+│   └── impostor
+└── scores
+    ├── authentic
+    │   ├── 0.npy
+    │   ├── 100.npy
+    │   ├── 101.npy
+    │   ├── ...
+    └── impostor
+```
+
+In this structure, the scores directory holds the different match types (i.e., authentic, impostor, or both), while the labels directory contains label pairs corresponding to these match types. 
+
+To access the authentic scores, you can utilize the `dask` library to load the entire directory containing the `numpy` stack. If the dataset can fit into memory, you have the option to load it  all at once, producing a unified `numpy` array. An example of this process is provided below:
+
+```python
+import dask.array as da
+import numpy as np
+
+authentic_scores_da = da.from_npy_stack("/path/to/output/scores/authentic")
+authentic_scores_np = np.asarray(authentic_scores_da)
+```
+
+Once the data is in this format, it becomes compatible with any scripts or applications that work with `numpy` arrays. If desired, you can save this data into a single file using the following code:
+
+```python
+np.save("authentic.npy", authentic_scores_np)
+```
+ 
 
 ## 💨 Performance Optimization and Memory Management
 
@@ -105,6 +151,7 @@ Here's an example command incorporating modified chunk sizes for advanced use:
 
 ```bash
 docker run --name advanced_feature_matcher \
+--net host \
 -v /path/to/probe/templates:/input \
 -v /path/to/gallery/templates:/gallery \
 -v /path/to/output:/output \
