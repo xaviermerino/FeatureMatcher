@@ -4,17 +4,19 @@ import re
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Callable, List, Tuple
-
+from typing import Any, Callable, List, Tuple, Union
+from dask.diagnostics import ProgressBar
 import dask
 import dask.array as da
 import dask.dataframe as dd
+import dask.delayed as delayed
 import numpy as np
 from bokeh.util.warnings import BokehUserWarning
 from dask.array.core import PerformanceWarning
 from dask.distributed import Client
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
+import shutil
 
 warnings.filterwarnings("ignore", category=BokehUserWarning)
 warnings.filterwarnings(
@@ -133,44 +135,192 @@ def process_scores(
     da.to_npy_stack(score_file_path, scores, axis=0)
 
 
+# def process_labels(
+#     match_type: str,
+#     mask: da.Array,
+#     p_labels_da: da.Array,
+#     g_labels_da: da.Array,
+#     output_directory: str,
+#     label_chunk_size: int,
+# ):
+#     x, y = da.where(mask == True)
+
+#     # This code calculates the chunks for later division
+#     # using `label_chunk_size`. Commented out because
+#     # performance is better without it at the moment.
+
+#     # x.compute_chunk_sizes(), y.compute_chunk_sizes()
+#     # x = x.rechunk(chunks=(label_chunk_size,))
+#     # y = y.rechunk(chunks=(label_chunk_size,))
+
+#     probe_label = p_labels_da[x]
+#     gallery_label = g_labels_da[y]
+
+#     label_pairs = da.concatenate(
+#         [probe_label[:, None], gallery_label[:, None]],
+#         axis=1,
+#         allow_unknown_chunksizes=True,
+#     )  # .rechunk(chunks=(label_chunk_size, 2))
+
+#     labels_directory = Path(output_directory) / "labels"
+#     labels_directory.mkdir(exist_ok=True, parents=True)
+#     labels_file_path = str(labels_directory / match_type / f"{match_type}_labels_*.csv")
+
+#     pairs_ddf = dd.from_dask_array(label_pairs, columns=["probe", "gallery"])
+#     print(f"Saving {match_type} labels to {labels_file_path}")
+#     pairs_ddf.to_csv(
+#         labels_file_path,
+#         index=False,
+#         header=False,
+#     )
+
+
 def process_labels(
     match_type: str,
     mask: da.Array,
     p_labels_da: da.Array,
     g_labels_da: da.Array,
     output_directory: str,
-    label_chunk_size: int,
+    label_chunk_size: int = 128,
 ):
+    import dask.dataframe as dd
+    import pandas as pd
+
     x, y = da.where(mask == True)
+    x.compute_chunk_sizes()
+    y.compute_chunk_sizes()
+    x = x.rechunk(chunks=(label_chunk_size,))
+    y = y.rechunk(chunks=(label_chunk_size,))
 
-    # This code calculates the chunks for later division
-    # using `label_chunk_size`. Commented out because
-    # performance is better without it at the moment.
+    # Stack x and y into indices array
+    indices = da.stack([x, y], axis=1).rechunk((label_chunk_size, 2))
 
-    # x.compute_chunk_sizes(), y.compute_chunk_sizes()
-    # x = x.rechunk(chunks=(label_chunk_size,))
-    # y = y.rechunk(chunks=(label_chunk_size,))
+    # Convert indices to Dask DataFrame
+    df_indices = dd.from_dask_array(indices, columns=["x", "y"])
 
-    probe_label = p_labels_da[x]
-    gallery_label = g_labels_da[y]
+    labels_directory = Path(output_directory) / "labels" / match_type
+    labels_directory.mkdir(parents=True, exist_ok=True)
 
-    label_pairs = da.concatenate(
-        [probe_label[:, None], gallery_label[:, None]],
-        axis=1,
-        allow_unknown_chunksizes=True,
-    )  # .rechunk(chunks=(label_chunk_size, 2))
+    def process_partition(df_partition):
+        x_chunk = df_partition["x"].values
+        y_chunk = df_partition["y"].values
 
-    labels_directory = Path(output_directory) / "labels"
-    labels_directory.mkdir(exist_ok=True, parents=True)
-    labels_file_path = str(labels_directory / match_type / f"{match_type}_labels_*.csv")
+        # Extract labels for the chunk
+        p_labels_chunk = da.take(p_labels_da, x_chunk, axis=0).compute()
+        g_labels_chunk = da.take(g_labels_da, y_chunk, axis=0).compute()
 
-    pairs_ddf = dd.from_dask_array(label_pairs, columns=["probe", "gallery"])
-    print(f"Saving {match_type} labels to {labels_file_path}")
-    pairs_ddf.to_csv(
-        labels_file_path,
-        index=False,
-        header=False,
-    )
+        # Create a DataFrame with the label pairs
+        label_pairs = pd.DataFrame(
+            {"p_label": p_labels_chunk, "g_label": g_labels_chunk}
+        )
+
+        return label_pairs
+
+    # Define the meta DataFrame to inform Dask about the output structure
+    meta = pd.DataFrame(columns=["p_label", "g_label"])
+
+    # Apply the function to each partition
+    label_pairs_df = df_indices.map_partitions(process_partition, meta=meta)
+
+    # Compute and collect the results
+    label_pairs_df = label_pairs_df.compute()
+
+    # Save the label pairs to the CSV file
+    labels_file_path = labels_directory / f"{match_type}_labels.csv"
+    label_pairs_df.to_csv(labels_file_path, index=False, header=False)
+
+    print(f"Labels saved to {labels_file_path}")
+
+
+# def process_chunk(
+#     i: int,
+#     indices_chunk: da.Array,
+#     p_labels_da: da.Array,
+#     g_labels_da: da.Array,
+#     output_directory: Union[str, Path],
+#     match_type: str,
+# ) -> str:
+#     """
+#     Processes a single chunk of indices and writes the corresponding label pairs to a temporary file.
+
+#     Parameters:
+#     - i: The chunk index.
+#     - indices_chunk: The chunk of indices (Dask array) to process.
+#     - p_labels_da: The Dask array of predicted labels.
+#     - g_labels_da: The Dask array of ground truth labels.
+#     - output_directory: The directory where the output files will be saved.
+#     - match_type: The type of match being processed, used for naming the output file.
+
+#     Returns:
+#     - str: The path to the temporary file where the label pairs are saved.
+#     """
+#     print(f"Process Chunk | Idx: {type(indices_chunk)} | P: {type(p_labels_da)} | G: {type(g_labels_da)}")
+#     chunk_data = indices_chunk #.compute()  # Compute the chunk
+#     x_chunk = chunk_data[:, 0]
+#     y_chunk = chunk_data[:, 1]
+
+#     # Extract labels for the chunk
+#     p_labels_chunk = da.take(p_labels_da, x_chunk, axis=0)
+#     g_labels_chunk = da.take(g_labels_da, y_chunk, axis=0)
+
+#     # Stack labels into pairs
+#     label_pairs = np.stack([p_labels_chunk, g_labels_chunk], axis=1)
+
+#     # Create a temporary file path
+#     print(f"Saving temporary file: temp_{match_type}_labels_chunk_{i}.csv")
+#     temp_file_path = Path(output_directory) / f"temp_{match_type}_labels_chunk_{i}.csv"
+
+#     # Save the label pairs to the temporary file
+#     with open(temp_file_path, "w", newline="") as f:
+#         np.savetxt(f, label_pairs, fmt="%s", delimiter=",")
+
+#     return str(temp_file_path)
+
+
+# def process_labels(
+#     match_type: str,
+#     mask: da.Array,
+#     p_labels_da: da.Array,
+#     g_labels_da: da.Array,
+#     output_directory: str,
+#     label_chunk_size: int = 128,
+# ):
+#     x, y = da.where(mask == True)
+#     x.compute_chunk_sizes()
+#     y.compute_chunk_sizes()
+#     x = x.rechunk(chunks=(label_chunk_size,))
+#     y = y.rechunk(chunks=(label_chunk_size,))
+
+#     indices = da.stack([x, y], axis=1)
+#     indices = indices.rechunk((label_chunk_size, 2))
+
+#     labels_directory = Path(output_directory) / "labels" / match_type
+#     labels_directory.mkdir(parents=True, exist_ok=True)
+
+#     n_chunks = len(indices.chunks[0])
+
+#     temp_files = []
+#     for i in range(n_chunks):
+#         indices_chunk = indices.blocks[i]
+#         print(f"Process Labels | Idx: {type(indices_chunk)} | P: {type(p_labels_da)} | G: {type(g_labels_da)}")
+#         temp_file = delayed(process_chunk)(
+#             i, indices_chunk, p_labels_da, g_labels_da, labels_directory, match_type
+#         )
+#         temp_files.append(temp_file)
+
+#     temp_file_paths = dask.compute(*temp_files)
+#     labels_file_path = labels_directory / f"{match_type}_labels.csv"
+#     print(f"Consolidating {len(temp_file_paths)} temporary files into {labels_file_path}...")
+
+#     # Join all temporary files into the final CSV file
+#     labels_file_path = labels_directory / f"{match_type}_labels.csv"
+#     with open(labels_file_path, "w", newline="") as outfile:
+#         for temp_file_path in tqdm(temp_file_paths, desc=f"Consolidating {match_type} labels"):
+#             with open(temp_file_path, "r") as infile:
+#                 shutil.copyfileobj(infile, outfile, length=10*1024*1024)  # Copy with a 10MB buffer
+#             os.remove(temp_file_path)  # Remove the temporary file after it's merged
+
+#     print(f"Labels saved to {labels_file_path}")
 
 
 def load_data(
@@ -226,7 +376,7 @@ def main(
     skip_matches: bool = False,
     match_chunk_size: int = 64,
     mask_chunk_size: int = 256,
-    label_chunk_size: int = 512,
+    label_chunk_size: int = 2048,
 ):
     if skip_labels and skip_matches:
         print("Nothing to do. Closing.")
@@ -345,11 +495,14 @@ def main(
                 p_labels_da = da.from_array(p_labels, chunks=(label_chunk_size,))
                 g_labels_da = g_labels_da.rechunk(chunks=(label_chunk_size,))
 
+                print(f"Type: {type(p_labels_da)}")
+                print(f"Type: {type(g_labels_da)}")
                 for lp in label_plan:
                     label_type = lp.split("_")[-1]
                     mask = (
                         mask_authentic if label_type == "authentic" else mask_impostor
                     )
+                    print(f"Processing {label_type} labels...")
                     process_labels(
                         match_type=label_type,
                         mask=mask,
@@ -500,7 +653,7 @@ if __name__ == "__main__":
         type=int,
         help="chunk size for generating label pairs\n(default: 512) [NotImplemented]",
         required=False,
-        default=512,
+        default=2048,
     )
     parser.add_argument(
         "--persist",
