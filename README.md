@@ -20,7 +20,10 @@ Below is a detailed overview of the command-line options available in Feature Ma
 | `--persist`           | N/A          | Enables caching of intermediate results, recommended only with ample RAM.                  | `False`  |
 | `--match-chunk-size`  | N/A          | Sets the number of probes processed per chunk.                                             | `64`     |
 | `--mask-chunk-size`   | N/A          | Number of entries for mask generation per chunk.                                           | `256`    |
-| `--label-chunk-size`  | N/A          | Number of label pairs processed per chunk (currently not implemented).                     | `512`    |
+| `--auto-label-chunk-size`  | N/A     | Automatically determine the chunk size based on the number of comparisons.                     | False    |
+| `--label-chunk-size`  | N/A          | Number of authentic and impostor label pairs processed per chunk                    | `8388608`    |
+| `--authentic-label-chunk-size`  | N/A          | Number of authentic label pairs processed per chunk.                     | `8388608`    |
+| `--impostor-label-chunk-size`  | N/A          | Number of impostor label pairs processed per chunk.                     | `1048576`    |
 
 ## 🐳 Getting Started on Docker
 
@@ -68,6 +71,7 @@ This command:
 - Opens up a dashboard to inspect progress on `https://127.0.0.1:8787/status`. The address might change if multiple instances are opened.
 - Replace `/path/to/probe/templates` and `/path/to/output` with the actual paths to your probe templates and output directory, respectively.
 
+
 ### 🏃🏃 Advanced Usage: Handling Treated Gallery Images
 
 For generating authentic and impostor scores, as well as label pairs, where gallery images have undergone treatments (like color correction), you can use a regex pattern to extract the correct label from the template filenames. This approach is particularly useful for distinguishing between treated and untreated images. Consider the following naming conventions for your templates:
@@ -107,11 +111,9 @@ By default, the output directory structure appears as follows:
 .
 ├── labels
 │   ├── authentic
-│   │   ├── authentic_labels_00.csv
-│   │   ├── authentic_labels_01.csv
-│   │   ├── authentic_labels_02.csv
-│   │   └── ...
+│   │   └── authentic_labels.csv
 │   └── impostor
+│       └── impostor_labels.csv
 └── scores
     ├── authentic
     │   ├── 0.npy
@@ -142,14 +144,13 @@ np.save("authentic.npy", authentic_scores_np)
 
 ## 💨 Performance Optimization and Memory Management
 
-Feature Matcher employs Dask to distribute computations across multiple workers in a single-machine cluster. Key to balancing performance and memory usage are the number of workers and the size of data chunks processed by each worker. You can fine-tune these settings using the `--match-chunk-size` and `--mask-chunk-size` options. 
+Feature Matcher employs Dask to distribute computations across multiple workers in a single-machine cluster. Key to balancing performance and memory usage are the number of workers and the size of data chunks processed by each worker. You can fine-tune these settings using the `--match-chunk-size` and `--mask-chunk-size` options. For label generation, the options `--label-chunk-size`, `--authentic-label-chunk-size`, `--impostor-label-chunk-size`, and `--auto-label-chunk-size` can be used.
 
-> *Note:* The `--label-chunk-size` option is currently not implemented, and its related code is commented out.
 
 ### 🔄 Default Configuration 
-By default, the tool is configured to handle large datasets efficiently without excessive memory consumption. For example, with default settings, processing match scores for 155,000 probes against themselves is estimated to consume a maximum of 23 GiB of RAM. This computation uses 20 cores on an i7-12700K processor and takes about 8 minutes, assuming the results are saved to a fast PCIe SSD.
+By default, the tool is configured to handle large datasets efficiently without excessive memory consumption. For example, with default settings, processing match scores for 155,000 probes against themselves is estimated to consume a maximum of 23 GiB of RAM. This computation uses 20 cores on an i7-12700K processor and takes about 8 minutes, assuming the results are saved to a fast PCIe SSD. Processing labels is also supported and is more time consuming since it is an I/O intensive process.
 
-### 🔧 Adjusting Chunk Sizes
+### 🔧 Adjusting Match Scores Chunk Sizes
 To modify the performance characteristics, adjust the chunk size parameters. Larger chunks can improve computational speed but at the cost of increased memory usage. Conversely, smaller chunks reduce memory usage but may slow down the process.
 
 Here's an example command incorporating modified chunk sizes for advanced use:
@@ -169,3 +170,49 @@ featurematcher \
 ```
 
 In this example, `--match-chunk-size` is set to `256` and `--mask-chunk-size` to `1024`, which may be adjusted based on your machine's specifications and the dataset size.
+
+### 🏷️ Adjusting Label Generation Chunk Sizes
+
+Label generation is a memory intensive process. To tweak it to your system's specifications, you can make use of the `--label-chunk-size`, `--authentic-label-chunk-size`, `--impostor-label-chunk-size`, and `--auto-label-chunk-size` options. This section explains how to use each option.
+
+#### Single Global Setting
+You can provide a `--label-chunk-size` option with a number for both authentic and impostor pairs. This will make sure that each batch of labels is approximately that size. Smaller sizes will occupy less memory. See an example below:
+
+```bash
+docker run --rm --name feature_matcher_instance \
+--net host \
+-v /path/to/probe/templates:/input \
+-v /path/to/output:/output \
+featurematcher \
+--probe-dir /input \
+--output-dir /output \
+--label-chunk-size 1000000
+```
+
+#### Different Authentic and Impostor Settings
+If you would like to specify a size for authentic and impostor labels, you can provide the appropriate number with the `--authentic-label-chunk-size` and `--impostor-label-chunk-size` instead:
+```bash
+docker run --rm --name feature_matcher_instance \
+--net host \
+-v /path/to/probe/templates:/input \
+-v /path/to/output:/output \
+featurematcher \
+--probe-dir /input \
+--output-dir /output \
+--authentic-label-chunk-size 1000000 \
+--impostor-label-chunk-size 500000
+```
+
+#### Automatic Settings
+Alternatively, you can let the program decide what would work best by estimating based on the number of comparisons that your dataset requires with the `--auto-label-chunk-size` option. This may not be optimal at times. 
+
+```bash
+docker run --rm --name feature_matcher_instance \
+--net host \
+-v /path/to/probe/templates:/input \
+-v /path/to/output:/output \
+featurematcher \
+--probe-dir /input \
+--output-dir /output \
+--auto-label-chunk-size
+```

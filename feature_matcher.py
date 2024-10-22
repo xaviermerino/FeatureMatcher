@@ -4,17 +4,17 @@ import re
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Callable, List, Tuple
-
+from typing import Any, List, Tuple
 import dask
 import dask.array as da
-import dask.dataframe as dd
 import numpy as np
 from bokeh.util.warnings import BokehUserWarning
 from dask.array.core import PerformanceWarning
 from dask.distributed import Client
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
+import shutil
+from dask import delayed
 
 warnings.filterwarnings("ignore", category=BokehUserWarning)
 warnings.filterwarnings(
@@ -136,41 +136,65 @@ def process_scores(
 def process_labels(
     match_type: str,
     mask: da.Array,
-    p_labels_da: da.Array,
-    g_labels_da: da.Array,
+    p_labels: np.ndarray,
+    g_labels: np.ndarray,
     output_directory: str,
     label_chunk_size: int,
 ):
-    x, y = da.where(mask == True)
 
-    # This code calculates the chunks for later division
-    # using `label_chunk_size`. Commented out because
-    # performance is better without it at the moment.
-
-    # x.compute_chunk_sizes(), y.compute_chunk_sizes()
-    # x = x.rechunk(chunks=(label_chunk_size,))
-    # y = y.rechunk(chunks=(label_chunk_size,))
-
-    probe_label = p_labels_da[x]
-    gallery_label = g_labels_da[y]
-
-    label_pairs = da.concatenate(
-        [probe_label[:, None], gallery_label[:, None]],
-        axis=1,
-        allow_unknown_chunksizes=True,
-    )  # .rechunk(chunks=(label_chunk_size, 2))
+    @delayed
+    def save_label_chunk_to_file(chunk: da.Array, chunk_id: int, n_chunks_digits: int):
+        if chunk.size > 0:
+            temp_file_path = (
+                labels_directory / f"tmp_{str(chunk_id).zfill(n_chunks_digits)}.csv"
+            )
+            p_indices = chunk[:, 0]
+            g_indices = chunk[:, 1]
+            p_chunk_labels = p_labels[p_indices]
+            g_chunk_labels = g_labels[g_indices]
+            combined_labels = np.column_stack((p_chunk_labels, g_chunk_labels))
+            np.savetxt(temp_file_path, combined_labels, fmt="%s", delimiter=",")
+            return temp_file_path
+        return None
 
     labels_directory = Path(output_directory) / "labels"
     labels_directory.mkdir(exist_ok=True, parents=True)
-    labels_file_path = str(labels_directory / match_type / f"{match_type}_labels_*.csv")
 
-    pairs_ddf = dd.from_dask_array(label_pairs, columns=["probe", "gallery"])
-    print(f"Saving {match_type} labels to {labels_file_path}")
-    pairs_ddf.to_csv(
-        labels_file_path,
-        index=False,
-        header=False,
+    x, y = da.where(mask == True)
+    x.compute_chunk_sizes()
+    y.compute_chunk_sizes()
+    indices = da.stack([x, y], axis=1)
+    indices = indices.rechunk((label_chunk_size, 2))
+
+    n_chunks = len(indices.chunks[0])
+    n_chunks_digits = len(str(n_chunks))
+    temp_file_tasks = []
+
+    for i in range(n_chunks):
+        indices_chunk = indices.blocks[i]
+        temp_file_tasks.append(
+            save_label_chunk_to_file(indices_chunk, i, n_chunks_digits)
+        )
+
+    temp_file_paths = sorted(dask.compute(*temp_file_tasks))
+    labels_file_path = labels_directory / f"{match_type}_labels.csv"
+    print(
+        f"Consolidating {len(temp_file_paths)} temporary files into {labels_file_path}..."
     )
+
+    labels_file_path = labels_directory / f"{match_type}_labels.csv"
+    with open(labels_file_path, "w", newline="") as outfile:
+        for temp_file_path in tqdm(
+            temp_file_paths, desc=f"Consolidating {match_type} labels"
+        ):
+            with open(temp_file_path, "r") as infile:
+                shutil.copyfileobj(
+                    infile, outfile, length=20 * 1024 * 1024
+                )  # Copy with a 20MB buffer
+            os.remove(temp_file_path)  # Remove the temporary file after it's merged
+
+    print(f"Labels saved to {labels_file_path}")
+    del x, y, indices
 
 
 def load_data(
@@ -187,7 +211,9 @@ def load_data(
     subjects = get_subject_ids(
         templates, regexp=regexp_subject, description=f"{description} Subjects: "
     )
-    labels = get_labels(templates, regexp=regexp_label, description="Labels: ")
+    labels = get_labels(
+        templates, regexp=regexp_label, description=f"{description} Labels: "
+    )
     return templates, features, subjects, labels
 
 
@@ -226,8 +252,12 @@ def main(
     skip_matches: bool = False,
     match_chunk_size: int = 64,
     mask_chunk_size: int = 256,
-    label_chunk_size: int = 512,
+    auto_label_chunk_size: bool = False,
+    authentic_label_chunk_size: int = 8388608,
+    impostor_label_chunk_size: int = 1048576,
 ):
+    start_time = time.time()
+
     if skip_labels and skip_matches:
         print("Nothing to do. Closing.")
         return
@@ -270,6 +300,17 @@ def main(
             description="Gallery",
         )
         print(f"Matching {probe_directory} to {gallery_directory}")
+
+    N = len(np.union1d(g_subjects, p_subjects))
+    t = len(np.concatenate((p_labels, g_labels))) / N
+    impostor_comparisons = int((N * (N - 1) * (t**2)) / 2)
+    authentic_comparisons = int((N * t * (t - 1)) / 2)
+    impostor_to_authentic_ratio = int(((N - 1) * t) // (t - 1))
+    print(f"Unique Subjects: {N}")
+    print(f"Avg. Samples per Subject: {t}")
+    print(f"Authentic Comparisons: ~{authentic_comparisons}")
+    print(f"Impostor Comparisons: ~{impostor_comparisons}")
+    print(f"Impostor-Authentic Ratio: {impostor_to_authentic_ratio}x")
 
     with Client() as client:
         print("Dashboard: ", client.dashboard_link)
@@ -339,23 +380,38 @@ def main(
 
             # Processing Label Pairs
             if label_plan:
-                p_labels = get_labels(
-                    p_templates, regexp=None, description="Probe Labels: "
-                )
-                p_labels_da = da.from_array(p_labels, chunks=(label_chunk_size,))
-                g_labels_da = g_labels_da.rechunk(chunks=(label_chunk_size,))
-
                 for lp in label_plan:
                     label_type = lp.split("_")[-1]
                     mask = (
                         mask_authentic if label_type == "authentic" else mask_impostor
                     )
+
+                    if auto_label_chunk_size:
+                        if label_type == "authentic":
+                            label_chunk_size = int(
+                                authentic_comparisons // os.cpu_count()
+                            )
+                        else:
+                            label_chunk_size = int(
+                                impostor_comparisons
+                                // (os.cpu_count() * 4 * impostor_to_authentic_ratio)
+                            )
+                    else:
+                        label_chunk_size = (
+                            authentic_label_chunk_size
+                            if label_type == "authentic"
+                            else impostor_label_chunk_size
+                        )
+
+                    print(
+                        f"Processing {label_type} labels with chunk size {label_chunk_size}..."
+                    )
                     process_labels(
                         match_type=label_type,
                         mask=mask,
                         output_directory=output_directory,
-                        p_labels_da=p_labels_da,
-                        g_labels_da=g_labels_da,
+                        p_labels=p_labels,
+                        g_labels=g_labels,
                         label_chunk_size=label_chunk_size,
                     )
 
@@ -366,6 +422,12 @@ def main(
 
         except Exception as e:
             print("[ERROR]", e)
+
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    hours, remainder = divmod(elapsed_time, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    print(f"Process took: {int(hours):02}:{int(minutes):02}:{int(seconds):02}")
 
 
 if __name__ == "__main__":
@@ -427,11 +489,29 @@ if __name__ == "__main__":
         to 256. Feel free to increase/decrease it based on your setup.
         This option directly affects performance of authentic/impostor determination.
 
-    The --label-chunk-size option allows you to specify how many label pairs entries are 
-        generated at a time for export into CSV. By default this is set to 512. 
+    The --label-chunk-size option allows you to specify how many authentic and impostor label pair 
+        entries are generated at a time for export into CSV. By default this is set to 2^23. 
         Feel free to increase/decrease it based on your setup.
-        This option directly affects performance of label pair generation.
-        [Note: Not Implemented]
+        This option directly affects performance of label pair generation. Too big of a number
+        may result in running out of memory. Too small might result in underutilization and longer
+        processing times.
+    
+    The --authentic-label-chunk-size option allows you to specify how many authentic label pair 
+        entries are generated at a time for export into CSV. By default this is set to 2^23. 
+        This overrides the number set by --label-chunk-size for authentic label pairs.
+        Feel free to increase/decrease it based on your setup.
+        This option directly affects performance of label pair generation. Too big of a number
+        may result in running out of memory. Too small might result in underutilization and longer
+        processing times.
+    
+    The --impostor-label-chunk-size option allows you to specify how many impostor label pair 
+        entries are generated at a time for export into CSV. By default this is set to 2^20. 
+        This overrides the number set by --label-chunk-size for impostor label pairs.
+        Feel free to increase/decrease it based on your setup.
+        This option directly affects performance of label pair generation. Too big of a number
+        may result in running out of memory. Too small might result in underutilization and longer
+        processing times.
+
 """
 
     parser = argparse.ArgumentParser(
@@ -498,9 +578,49 @@ if __name__ == "__main__":
     parser.add_argument(
         "--label-chunk-size",
         type=int,
-        help="chunk size for generating label pairs\n(default: 512) [NotImplemented]",
+        help=(
+            "chunk size for generating label pairs for both authentic and impostor pairs\n"
+            "only considered when --auto-label-chunk-size option is disabled\n"
+            "separate sizes can be specified using --authentic-label-chunk-size and --impostor-label-chunk-size\n"
+            "(default: 2^23)"
+        ),
         required=False,
-        default=512,
+        default=8388608,
+    )
+    parser.add_argument(
+        "--authentic-label-chunk-size",
+        type=int,
+        help=(
+            "chunk size for generating authentic label pairs\n"
+            "overrides --label-chunk-size for authentic label pairs\n"
+            "only considered when --auto-label-chunk-size option is not used\n"
+            "(default: 2^23)"
+        ),
+        required=False,
+        default=8388608,
+    )
+    parser.add_argument(
+        "--impostor-label-chunk-size",
+        type=int,
+        help=(
+            "chunk size for generating impostor label pairs\n"
+            "overrides --label-chunk-size for impostor label pairs\n"
+            "only considered when --auto-label-chunk-size option is not used\n"
+            "(default: 2^20)"
+        ),
+        required=False,
+        default=1048576,
+    )
+    parser.add_argument(
+        "--auto-label-chunk-size",
+        action="store_true",
+        help=(
+            "automatically determines chunk size for generating label based on number of pairs\n"
+            "when enabled, --label-chunk-size, --authentic-label-chunk-size, and\n"
+            "--impostor-label-chunk-size are ignored\n"
+            "(default: False)"
+        ),
+        required=False,
     )
     parser.add_argument(
         "--persist",
@@ -518,6 +638,15 @@ if __name__ == "__main__":
 
     Path(args.output_dir).mkdir(exist_ok=True, parents=True)
 
+    authentic_label_chunk_size = args.label_chunk_size
+    impostor_label_chunk_size = args.label_chunk_size
+
+    if args.authentic_label_chunk_size is not None:
+        authentic_label_chunk_size = args.authentic_label_chunk_size
+
+    if args.impostor_label_chunk_size is not None:
+        impostor_label_chunk_size = args.impostor_label_chunk_size
+
     main(
         probe_directory=args.probe_dir,
         gallery_directory=args.gallery_dir,
@@ -530,5 +659,7 @@ if __name__ == "__main__":
         skip_matches=args.skip_matches,
         match_chunk_size=args.match_chunk_size,
         mask_chunk_size=args.mask_chunk_size,
-        label_chunk_size=args.label_chunk_size,
+        auto_label_chunk_size=args.auto_label_chunk_size,
+        authentic_label_chunk_size=authentic_label_chunk_size,
+        impostor_label_chunk_size=impostor_label_chunk_size,
     )
