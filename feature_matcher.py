@@ -136,66 +136,18 @@ def process_scores(
 def process_labels(
     match_type: str,
     mask: da.Array,
-    p_labels: np.ndarray,
-    g_labels: np.ndarray,
-    output_directory: str,
-    label_chunk_size: int,
+    output_directory: str | Path,
 ):
 
-    @delayed
-    def save_label_chunk_to_file(chunk: da.Array, chunk_id: int, n_chunks_digits: int):
-        if chunk.size > 0:
-            temp_file_path = (
-                labels_directory / f"tmp_{str(chunk_id).zfill(n_chunks_digits)}.csv"
-            )
-            p_indices = chunk[:, 0]
-            g_indices = chunk[:, 1]
-            p_chunk_labels = p_labels[p_indices]
-            g_chunk_labels = g_labels[g_indices]
-            combined_labels = np.column_stack((p_chunk_labels, g_chunk_labels))
-            np.savetxt(temp_file_path, combined_labels, fmt="%s", delimiter=",")
-            return temp_file_path
-        return None
-
-    labels_directory = Path(output_directory) / "labels"
-    labels_directory.mkdir(exist_ok=True, parents=True)
-
+    labels_directory = Path(output_directory)
     x, y = da.where(mask == True)
     x.compute_chunk_sizes()
     y.compute_chunk_sizes()
     indices = da.stack([x, y], axis=1)
-    indices = indices.rechunk((label_chunk_size, 2))
-
-    n_chunks = len(indices.chunks[0])
-    n_chunks_digits = len(str(n_chunks))
-    temp_file_tasks = []
-
-    for i in range(n_chunks):
-        indices_chunk = indices.blocks[i]
-        temp_file_tasks.append(
-            save_label_chunk_to_file(indices_chunk, i, n_chunks_digits)
-        )
-
-    temp_file_paths = sorted(dask.compute(*temp_file_tasks))
-    labels_file_path = labels_directory / f"{match_type}_labels.csv"
-    print(
-        f"Consolidating {len(temp_file_paths)} temporary files into {labels_file_path}..."
-    )
-
-    labels_file_path = labels_directory / f"{match_type}_labels.csv"
-    with open(labels_file_path, "w", newline="") as outfile:
-        for temp_file_path in tqdm(
-            temp_file_paths, desc=f"Consolidating {match_type} labels"
-        ):
-            with open(temp_file_path, "r") as infile:
-                shutil.copyfileobj(
-                    infile, outfile, length=20 * 1024 * 1024
-                )  # Copy with a 20MB buffer
-            os.remove(temp_file_path)  # Remove the temporary file after it's merged
-
-    print(f"Labels saved to {labels_file_path}")
-    del x, y, indices
-
+    indices.rechunk(chunks={0: "auto", 1: 2})
+    npy_stack_dir = labels_directory / f"{match_type}_indices"
+    da.to_npy_stack(str(npy_stack_dir), indices, axis=0)
+    del indices
 
 def load_data(
     directory: str,
@@ -380,42 +332,32 @@ def main(
 
             # Processing Label Pairs
             if label_plan:
+                labels_directory = Path(output_directory) / "labels"
+                labels_directory.mkdir(exist_ok=True, parents=True)
+
                 for lp in label_plan:
                     label_type = lp.split("_")[-1]
                     mask = (
                         mask_authentic if label_type == "authentic" else mask_impostor
                     )
 
-                    if auto_label_chunk_size:
-                        if label_type == "authentic":
-                            label_chunk_size = int(
-                                authentic_comparisons // os.cpu_count()
-                            )
-                        else:
-                            label_chunk_size = int(
-                                impostor_comparisons
-                                // (os.cpu_count() * 4 * impostor_to_authentic_ratio)
-                            )
-                    else:
-                        label_chunk_size = (
-                            authentic_label_chunk_size
-                            if label_type == "authentic"
-                            else impostor_label_chunk_size
-                        )
-
-                    print(
-                        f"Processing {label_type} labels with chunk size {label_chunk_size}..."
-                    )
                     process_labels(
-                        match_type=label_type,
                         mask=mask,
-                        output_directory=output_directory,
-                        p_labels=p_labels,
-                        g_labels=g_labels,
-                        label_chunk_size=label_chunk_size,
+                        match_type=label_type,
+                        output_directory=labels_directory,
                     )
 
                     del mask
+                
+                p_labels_file = labels_directory / f"probe_labels.txt"
+                with open(p_labels_file, "w") as f:
+                    for label in p_labels:
+                        f.write(f"{label}\n")
+
+                g_labels_file = labels_directory / f"gallery_labels.txt"
+                with open(g_labels_file, "w") as f:
+                    for label in g_labels:
+                        f.write(f"{label}\n")
 
             time.sleep(2)
             print("Done!")
