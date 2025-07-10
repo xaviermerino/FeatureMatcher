@@ -253,16 +253,32 @@ def main(
         )
         print(f"Matching {probe_directory} to {gallery_directory}")
 
-    N = len(np.union1d(g_subjects, p_subjects))
-    t = len(np.concatenate((p_labels, g_labels))) / N
-    impostor_comparisons = int((N * (N - 1) * (t**2)) / 2)
-    authentic_comparisons = int((N * t * (t - 1)) / 2)
-    impostor_to_authentic_ratio = int(((N - 1) * t) // (t - 1))
+    N = len(np.union1d(g_subjects, p_subjects))                 # unique subjects
+    total_templates = len(p_labels) + len(g_labels)
+    t = total_templates / N if N else 0                         # avg samples / subject
+    authentic_comparisons = 0
+    impostor_comparisons  = 0
+    impostor_to_authentic_ratio = "N/A"
+    want_auth = match_type in ("authentic", "all")
+    want_imp  = match_type in ("impostor",  "all")
+
+    if t > 1 and want_auth: # possible authentic pairs
+        authentic_comparisons = int((N * t * (t - 1)) / 2)
+
+    if want_imp:
+        impostor_comparisons = int((N * (N - 1) * (t**2)) / 2) if N > 1 else 0
+
+    if authentic_comparisons:
+        impostor_to_authentic_ratio = impostor_comparisons // authentic_comparisons
+    elif want_auth and not authentic_comparisons:
+        impostor_to_authentic_ratio = "undefined (no authentic pairs)"
+
     print(f"Unique Subjects: {N}")
-    print(f"Avg. Samples per Subject: {t}")
+    print(f"Avg. Samples per Subject: {t:.2f}")
     print(f"Authentic Comparisons: ~{authentic_comparisons}")
-    print(f"Impostor Comparisons: ~{impostor_comparisons}")
-    print(f"Impostor-Authentic Ratio: {impostor_to_authentic_ratio}x")
+    print(f"Impostor Comparisons:  ~{impostor_comparisons}")
+    print(f"Impostor-Authentic Ratio: {impostor_to_authentic_ratio}")
+
 
     with Client() as client:
         print("Dashboard: ", client.dashboard_link)
